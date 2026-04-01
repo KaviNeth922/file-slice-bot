@@ -5,6 +5,11 @@ Uses MTProto directly: works for ALL file sizes, no Bot API 2GB limit.
 
 NEW: Send any YouTube URL → bot downloads 1080p MP4 on server → splits
      if needed → sends back as Telegram-playable video (H.264).
+
+Bot-detection fix: bgutil POT server runs on port 4416 (via supervisord),
+the bgutil-ytdlp-pot-provider plugin auto-feeds PO tokens to yt-dlp.
+Optional: place a cookies.txt (Netscape format) at /app/cookies.txt for
+extra reliability on heavily-restricted IPs.
 """
 
 import os
@@ -27,6 +32,9 @@ DOWNLOAD_DIR      = Path(os.environ.get("DOWNLOAD_DIR", "/tmp/tg_splitter"))
 SPLIT_SIZE_MB     = int(os.environ.get("SPLIT_SIZE_MB", "490"))
 ALLOWED_IDS_RAW   = os.environ.get("ALLOWED_USER_IDS", "")
 ALLOWED_IDS       = set(int(x.strip()) for x in ALLOWED_IDS_RAW.split(",") if x.strip())
+
+# Optional cookies file — place exported YouTube cookies here for extra bypass
+COOKIES_FILE      = Path(os.environ.get("YT_COOKIES_FILE", "/app/cookies.txt"))
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -61,11 +69,7 @@ def extract_youtube_url(text: str) -> str | None:
     """Return the full YouTube URL if found in text, else None."""
     m = _YT_PATTERN.search(text)
     if m:
-        # Re-construct a clean URL from the matched video ID
-        vid_id = m.group(1)
-        # Return the original matched URL segment (cleaner for yt-dlp)
         start = m.start()
-        # Grab the raw URL token
         raw = text[start:].split()[0].rstrip(".,;!?)")
         if not raw.startswith("http"):
             raw = "https://" + raw
@@ -148,21 +152,97 @@ class LiveStatus:
             pass
 
 
-# ── YouTube download via yt-dlp ────────────────────────────────────────────────
+# ── yt-dlp options builder ────────────────────────────────────────────────────
+
+def _build_ydl_opts(out_tmpl: str, progress_hook) -> dict:
+    """
+    Build yt-dlp options that work reliably on cloud/datacenter IPs.
+
+    Key decisions:
+    - No extractor_args skip: letting yt-dlp use its default clients
+      (android_vr + web_safari) is necessary for the bgutil POT plugin
+      to inject tokens properly.
+    - bgutil-ytdlp-pot-provider plugin (installed via pip) auto-reads
+      from the bgutil HTTP server on localhost:4416 — no manual config needed.
+    - cookiefile: optional extra bypass; loaded only if the file exists.
+    - Format chain: tries native H.264 MP4 first (no re-encode needed),
+      falls back to any ≤1080p, then any format if nothing else works.
+    - postprocessor_args applied only to the FFmpegVideoConvertor step.
+    """
+    opts = {
+        # ── Format selection ──────────────────────────────────────────────────
+        # Priority: H.264+AAC native MP4 → any ≤1080p video+audio → best
+        "format": (
+            "bestvideo[height<=1080][vcodec^=avc][ext=mp4]"
+            "+bestaudio[acodec^=mp4a][ext=m4a]"
+            "/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[height<=1080]+bestaudio"
+            "/best[height<=1080]"
+            "/best"
+        ),
+        "merge_output_format": "mp4",
+        "outtmpl": out_tmpl,
+
+        # ── Output ────────────────────────────────────────────────────────────
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": False,   # keep warnings so we can log POT issues
+        "progress_hooks": [progress_hook],
+
+        # ── Post-processing: ensure H.264 + AAC for Telegram ─────────────────
+        "postprocessors": [{
+            "key": "FFmpegVideoConvertor",
+            "preferedformat": "mp4",
+        }],
+        # FFmpeg args for the video convertor step only
+        "postprocessor_args": {
+            "FFmpegVideoConvertor": [
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "18",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-movflags", "+faststart",
+                "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            ]
+        },
+
+        # ── Reliability ───────────────────────────────────────────────────────
+        "retries": 10,
+        "fragment_retries": 10,
+        "file_access_retries": 5,
+        "http_chunk_size": 10 * 1024 * 1024,  # 10 MB — avoids YT throttling
+    }
+
+    # Add cookies if file exists (optional but helps on heavily-blocked IPs)
+    if COOKIES_FILE.exists():
+        opts["cookiefile"] = str(COOKIES_FILE)
+        log.info(f"Using cookies file: {COOKIES_FILE}")
+
+    return opts
+
+
+# ── YouTube info fetch ────────────────────────────────────────────────────────
 
 async def get_yt_info(url: str) -> dict | None:
-    """Fetch video metadata (title, duration, filesize_approx) without downloading."""
+    """Fetch video metadata without downloading."""
     import yt_dlp
-    ydl_opts = {
+
+    info_opts = {
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
         "skip_download": True,
         "noplaylist": True,
     }
+    if COOKIES_FILE.exists():
+        info_opts["cookiefile"] = str(COOKIES_FILE)
+
     loop = asyncio.get_running_loop()
+
     def _fetch():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(info_opts) as ydl:
             return ydl.extract_info(url, download=False)
+
     try:
         return await loop.run_in_executor(None, _fetch)
     except Exception as e:
@@ -170,25 +250,20 @@ async def get_yt_info(url: str) -> dict | None:
         return None
 
 
+# ── YouTube download ──────────────────────────────────────────────────────────
+
 async def download_youtube(url: str, dest_dir: Path,
                             st: LiveStatus, t0: float, uid: int) -> Path:
     """
-    Download YouTube video at best quality ≤ 1080p as MP4 using yt-dlp.
-    Uses H.264 video + AAC audio so output is directly Telegram-playable.
-    Falls back gracefully: 1080p → best available.
-
-    Format priority:
-      1. bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]   (native MP4 stream)
-      2. bestvideo[height<=1080]+bestaudio  (any codec, ffmpeg merges to mp4)
-      3. best[height<=1080]                 (pre-merged)
-      4. best                               (whatever is available)
+    Download YouTube video at best quality ≤ 1080p as H.264 MP4.
+    Uses bgutil POT provider (running on localhost:4416) to bypass
+    datacenter IP bot-detection.
     """
     import yt_dlp
 
-    out_tmpl = str(dest_dir / "%(title).80s.%(ext)s")
-    result_path: list[Path] = []
-    last_status = {"text": ""}
-    spin_i = 0
+    out_tmpl      = str(dest_dir / "%(title).80s.%(ext)s")
+    result_path   = []
+    spin_i        = 0
 
     def _progress_hook(d: dict):
         nonlocal spin_i
@@ -202,7 +277,6 @@ async def download_youtube(url: str, dest_dir: Path,
             speed      = d.get("speed") or 0
             eta        = d.get("eta") or 0
             frac       = downloaded / total if total else 0
-            filename   = Path(d.get("filename", "video")).name
             txt = (
                 f"📥 *Downloading YouTube video*\n\n"
                 f"`{bar(frac)}` {frac*100:.0f}%\n"
@@ -211,8 +285,6 @@ async def download_youtube(url: str, dest_dir: Path,
                 f"Elapsed: {since(t0)}\n\n"
                 f"_Send_ `stop` _to cancel_"
             )
-            last_status["text"] = txt
-            # Fire-and-forget set (non-blocking inside sync hook)
             asyncio.get_event_loop().call_soon_threadsafe(
                 asyncio.ensure_future, st.set(txt)
             )
@@ -221,44 +293,7 @@ async def download_youtube(url: str, dest_dir: Path,
             if filepath:
                 result_path.append(Path(filepath))
 
-    ydl_opts = {
-        # Best H.264 ≤ 1080p + best AAC audio → merge to mp4
-        # Fallback chain handles cases where native mp4 streams aren't available
-        "format": (
-            "bestvideo[height<=1080][vcodec^=avc]+bestaudio[acodec^=mp4a]"
-            "/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
-            "/bestvideo[height<=1080]+bestaudio"
-            "/best[height<=1080]"
-            "/best"
-        ),
-        "merge_output_format": "mp4",
-        "outtmpl": out_tmpl,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "progress_hooks": [_progress_hook],
-        # Post-process: ensure H.264 + AAC for Telegram compatibility
-        "postprocessors": [{
-            "key": "FFmpegVideoConvertor",
-            "preferedformat": "mp4",
-        }],
-        # ffmpeg flags: faststart for streaming in Telegram
-        "postprocessor_args": {
-            "ffmpeg": [
-                "-c:v", "libx264",
-                "-preset", "fast",
-                "-crf", "18",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-movflags", "+faststart",
-                "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            ]
-        },
-        "retries": 5,
-        "fragment_retries": 5,
-        # Update yt-dlp extractor info to handle YouTube API changes
-        "extractor_args": {"youtube": {"skip": ["hls", "dash"]}},
-    }
+    ydl_opts = _build_ydl_opts(out_tmpl, _progress_hook)
 
     loop = asyncio.get_running_loop()
 
@@ -268,29 +303,26 @@ async def download_youtube(url: str, dest_dir: Path,
 
     await loop.run_in_executor(None, _download)
 
-    # Find the output file (yt-dlp may rename it during post-processing)
+    # Locate the output file
     if result_path:
-        # yt-dlp sometimes appends .mp4 during merge
         candidate = result_path[-1]
         if candidate.exists():
             return candidate
-        # Try with .mp4 extension
         mp4 = candidate.with_suffix(".mp4")
         if mp4.exists():
             return mp4
 
-    # Fallback: find any mp4 in dest_dir
-    mp4s = sorted(dest_dir.glob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True)
-    if mp4s:
-        return mp4s[0]
-
-    # Any video file
-    for ext in ("*.mp4", "*.mkv", "*.webm", "*.mov"):
-        files = sorted(dest_dir.glob(ext), key=lambda f: f.stat().st_mtime, reverse=True)
+    # Fallback: newest mp4 in dest_dir
+    for pattern in ("*.mp4", "*.mkv", "*.webm", "*.mov"):
+        files = sorted(dest_dir.glob(pattern), key=lambda f: f.stat().st_mtime, reverse=True)
         if files:
             return files[0]
 
-    raise RuntimeError("yt-dlp finished but no output file found in download directory.")
+    raise RuntimeError(
+        "yt-dlp finished but no output file found.\n"
+        "This usually means YouTube blocked the download even after POT tokens.\n"
+        "Try adding a cookies.txt file at /app/cookies.txt (exported from Firefox)."
+    )
 
 
 # ── YouTube job ────────────────────────────────────────────────────────────────
@@ -310,18 +342,23 @@ async def process_youtube_job(orig_msg: Message, uid: int,
     )
 
     try:
-        # ── 1. Fetch metadata ──────────────────────────────────────────────────
         if is_stopped(uid):
             raise asyncio.CancelledError("Stopped")
 
         info = await get_yt_info(url)
         if not info:
-            raise RuntimeError("Could not fetch video info. The URL may be private, age-restricted, or unavailable.")
+            raise RuntimeError(
+                "Could not fetch video info.\n\n"
+                "Possible causes:\n"
+                "• Video is private or deleted\n"
+                "• Age-restricted (add cookies.txt)\n"
+                "• POT server not ready yet (wait 10s and retry)\n"
+                "• YouTube geo-blocked this IP"
+            )
 
         title    = info.get("title", "video")[:80]
         duration = info.get("duration") or 0
         uploader = info.get("uploader") or info.get("channel") or "YouTube"
-        # Estimate size from filesize_approx or duration × ~2 MB/s for 1080p
         est_size = info.get("filesize_approx") or int(duration * 2_000_000)
 
         await st.now(
@@ -331,35 +368,28 @@ async def process_youtube_job(orig_msg: Message, uid: int,
             f"⏬ Downloading 1080p MP4..."
         )
 
-        # ── 2. Download ────────────────────────────────────────────────────────
         if is_stopped(uid):
             raise asyncio.CancelledError("Stopped")
 
-        result = await download_youtube(url, job_dir, st, t0, uid)
-
-        if not result.exists():
-            raise RuntimeError("Download finished but output file missing.")
-        if is_stopped(uid):
-            raise asyncio.CancelledError("Stopped")
-
-        actual  = result.stat().st_size
-        dl_time = since(t0)
+        result   = await download_youtube(url, job_dir, st, t0, uid)
+        actual   = result.stat().st_size
+        dl_time  = since(t0)
         filename = result.name
         log.info(f"YT downloaded '{filename}' {human_size(actual)} in {dl_time}")
 
         thresh  = SPLIT_SIZE_MB * 1024 * 1024
         n_parts = max(1, math.ceil(actual / thresh))
 
-        # ── 3. Upload or split+upload ──────────────────────────────────────────
         if n_parts == 1:
             await st.now(
                 f"✅ *Downloaded* in {dl_time}\n\n"
                 f"📺 *{title}*\n"
                 f"{human_size(actual)}\n\n📤 Uploading to Telegram..."
             )
+            me = await app.get_me()
             await do_upload(
                 orig_msg, result,
-                f"📺 {title}\n{human_size(actual)} · via @{(await app.get_me()).username}",
+                f"📺 {title}\n{human_size(actual)} · @{me.username}",
                 st,
                 f"📺 *{title}*\n\n",
                 t0,
@@ -420,10 +450,6 @@ async def process_youtube_job(orig_msg: Message, uid: int,
 
 async def download_file(msg: Message, dest: Path,
                          st: LiveStatus, t0: float, uid: int) -> Path:
-    """
-    Download the media from a Pyrogram Message object directly.
-    Works for files of ANY size via MTProto.
-    """
     media     = msg.document or msg.video or msg.audio or msg.voice or msg.video_note
     file_size = getattr(media, "file_size", 0) or 0
     filename  = getattr(media, "file_name", None) or dest.name
@@ -445,15 +471,11 @@ async def download_file(msg: Message, dest: Path,
             f"Elapsed: {since(t0)}"
         )
 
-    result = await app.download_media(
-        msg,
-        file_name=str(dest),
-        progress=progress,
-    )
+    result = await app.download_media(msg, file_name=str(dest), progress=progress)
     return Path(result)
 
 
-# ── ffmpeg: H.264 re-encode per segment (playable in Telegram) ─────────────────
+# ── ffmpeg: H.264 re-encode per segment ──────────────────────────────────────
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".ts", ".m4v", ".wmv"}
 
@@ -522,7 +544,7 @@ async def ffmpeg_split(src: Path, out_dir: Path, n: int,
     return parts
 
 
-# ── Binary split (non-video, 4 MB buffer) ─────────────────────────────────────
+# ── Binary split (non-video) ──────────────────────────────────────────────────
 
 def _binary_split(src: Path, out_dir: Path, chunk: int, stem: str, suffix: str) -> list:
     BUF   = 4 * 1024 * 1024
@@ -554,7 +576,7 @@ def _binary_split(src: Path, out_dir: Path, chunk: int, stem: str, suffix: str) 
     return parts
 
 
-# ── Master split ───────────────────────────────────────────────────────────────
+# ── Master split ──────────────────────────────────────────────────────────────
 
 async def do_split(src: Path, n: int, st: LiveStatus,
                    name: str, t0: float, uid: int):
@@ -609,13 +631,12 @@ async def do_split(src: Path, n: int, st: LiveStatus,
     return parts, out_dir
 
 
-# ── Upload via Pyrogram ────────────────────────────────────────────────────────
+# ── Upload via Pyrogram ───────────────────────────────────────────────────────
 
 async def do_upload(orig_msg: Message, path: Path, caption: str,
                      st: LiveStatus, prefix: str, t0: float):
-    size   = path.stat().st_size
-    si     = 0
-    name   = path.name
+    si   = 0
+    name = path.name
 
     async def progress(current, total):
         nonlocal si
@@ -649,7 +670,7 @@ async def do_upload(orig_msg: Message, path: Path, caption: str,
         )
 
 
-# ── Core file-split job ────────────────────────────────────────────────────────
+# ── Core file-split job ───────────────────────────────────────────────────────
 
 async def process_job(orig_msg: Message, uid: int, n_parts: int,
                        status_msg: Message):
@@ -684,7 +705,6 @@ async def process_job(orig_msg: Message, uid: int, n_parts: int,
         thresh  = SPLIT_SIZE_MB * 1024 * 1024
         log.info(f"Downloaded '{filename}' {human_size(actual)} in {dl_time}")
 
-        # No split needed
         if actual <= thresh or n_parts == 1:
             await st.now(
                 f"✅ *Downloaded* in {dl_time}\n\n"
@@ -698,7 +718,6 @@ async def process_job(orig_msg: Message, uid: int, n_parts: int,
             await st.done(f"✅ *Done!* `{filename}` — {since(t0)}")
             return
 
-        # Split needed
         await st.now(
             f"✅ *Downloaded* in {dl_time}\n\n"
             f"`{filename}` — {human_size(actual)}\n\n"
@@ -712,7 +731,6 @@ async def process_job(orig_msg: Message, uid: int, n_parts: int,
 
         total = len(parts)
         result.unlink(missing_ok=True)
-
         suffix = Path(filename).suffix.lower()
         is_vid = suffix in VIDEO_EXTS
 
@@ -749,7 +767,7 @@ async def process_job(orig_msg: Message, uid: int, n_parts: int,
             shutil.rmtree(job_dir, ignore_errors=True)
 
 
-# ── Handlers ───────────────────────────────────────────────────────────────────
+# ── Handlers ──────────────────────────────────────────────────────────────────
 
 @app.on_message(filters.command(["start", "help"]))
 async def cmd_start(_, msg: Message):
@@ -851,7 +869,6 @@ async def handle_file(_, msg: Message):
     is_vid        = suffix in VIDEO_EXTS
 
     vid_note = "\n_Video → re-encoded H.264, playable in Telegram_" if is_vid else ""
-
     pending[uid] = {"msg": msg, "filename": filename, "filesize": filesize}
 
     if default_parts == 1:
@@ -877,7 +894,7 @@ async def handle_text(_, msg: Message):
     uid  = msg.from_user.id
     text = msg.text.strip()
 
-    # ── Stop command ───────────────────────────────────────────────────────────
+    # ── Stop ──────────────────────────────────────────────────────────────────
     if text.lower() == "stop":
         if uid in stop_flags:
             stop_flags[uid].set()
@@ -886,7 +903,7 @@ async def handle_text(_, msg: Message):
             await msg.reply("Nothing is running.")
         return
 
-    # ── YouTube URL detection ──────────────────────────────────────────────────
+    # ── YouTube URL ───────────────────────────────────────────────────────────
     yt_url = extract_youtube_url(text)
     if yt_url:
         if not is_allowed(uid):
@@ -895,7 +912,6 @@ async def handle_text(_, msg: Message):
         if uid in stop_flags:
             await msg.reply("⚠️ A job is already running. Send `stop` first.")
             return
-        # Clear any pending file split confirmation
         pending.pop(uid, None)
         status_msg = await msg.reply("⚙️ Starting YouTube download...")
         stop_flags[uid] = asyncio.Event()
@@ -904,7 +920,7 @@ async def handle_text(_, msg: Message):
         )
         return
 
-    # ── Parts answer (file split confirmation) ─────────────────────────────────
+    # ── Parts answer ──────────────────────────────────────────────────────────
     if uid not in pending:
         return
 
@@ -948,7 +964,7 @@ async def handle_text(_, msg: Message):
     )
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     log.info("Starting Pyrogram bot...")
