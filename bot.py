@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Telegram File Splitter Bot — Pyrogram only (no PTB)
+Telegram File Splitter + YouTube Downloader Bot — Pyrogram only (no PTB)
 Uses MTProto directly: works for ALL file sizes, no Bot API 2GB limit.
+
+NEW: Send any YouTube URL → bot downloads 1080p MP4 on server → splits
+     if needed → sends back as Telegram-playable video (H.264).
 """
 
 import os
+import re
 import asyncio
 import logging
 import shutil
@@ -42,6 +46,31 @@ app = Client(
 # Per-user state
 pending:    dict = {}   # uid → {msg, filename, file_size}
 stop_flags: dict = {}   # uid → asyncio.Event
+
+
+# ── YouTube URL detection ──────────────────────────────────────────────────────
+
+_YT_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.|m\.|music\.)?"
+    r"(?:youtube\.com/(?:watch\?.*v=|shorts/|live/|embed/|v/)|youtu\.be/)"
+    r"([\w\-]{11})",
+    re.IGNORECASE,
+)
+
+def extract_youtube_url(text: str) -> str | None:
+    """Return the full YouTube URL if found in text, else None."""
+    m = _YT_PATTERN.search(text)
+    if m:
+        # Re-construct a clean URL from the matched video ID
+        vid_id = m.group(1)
+        # Return the original matched URL segment (cleaner for yt-dlp)
+        start = m.start()
+        # Grab the raw URL token
+        raw = text[start:].split()[0].rstrip(".,;!?)")
+        if not raw.startswith("http"):
+            raw = "https://" + raw
+        return raw
+    return None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -119,17 +148,282 @@ class LiveStatus:
             pass
 
 
+# ── YouTube download via yt-dlp ────────────────────────────────────────────────
+
+async def get_yt_info(url: str) -> dict | None:
+    """Fetch video metadata (title, duration, filesize_approx) without downloading."""
+    import yt_dlp
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+    }
+    loop = asyncio.get_running_loop()
+    def _fetch():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    try:
+        return await loop.run_in_executor(None, _fetch)
+    except Exception as e:
+        log.warning(f"yt-dlp info failed: {e}")
+        return None
+
+
+async def download_youtube(url: str, dest_dir: Path,
+                            st: LiveStatus, t0: float, uid: int) -> Path:
+    """
+    Download YouTube video at best quality ≤ 1080p as MP4 using yt-dlp.
+    Uses H.264 video + AAC audio so output is directly Telegram-playable.
+    Falls back gracefully: 1080p → best available.
+
+    Format priority:
+      1. bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]   (native MP4 stream)
+      2. bestvideo[height<=1080]+bestaudio  (any codec, ffmpeg merges to mp4)
+      3. best[height<=1080]                 (pre-merged)
+      4. best                               (whatever is available)
+    """
+    import yt_dlp
+
+    out_tmpl = str(dest_dir / "%(title).80s.%(ext)s")
+    result_path: list[Path] = []
+    last_status = {"text": ""}
+    spin_i = 0
+
+    def _progress_hook(d: dict):
+        nonlocal spin_i
+        if is_stopped(uid):
+            raise yt_dlp.utils.DownloadError("Stopped by user")
+        spin_i += 1
+        status = d.get("status", "")
+        if status == "downloading":
+            downloaded = d.get("downloaded_bytes", 0) or 0
+            total      = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            speed      = d.get("speed") or 0
+            eta        = d.get("eta") or 0
+            frac       = downloaded / total if total else 0
+            filename   = Path(d.get("filename", "video")).name
+            txt = (
+                f"📥 *Downloading YouTube video*\n\n"
+                f"`{bar(frac)}` {frac*100:.0f}%\n"
+                f"{human_size(downloaded)} / {human_size(total) if total else '?'}\n"
+                f"{spin(spin_i)} {human_size(int(speed))}/s   ETA: {eta}s\n"
+                f"Elapsed: {since(t0)}\n\n"
+                f"_Send_ `stop` _to cancel_"
+            )
+            last_status["text"] = txt
+            # Fire-and-forget set (non-blocking inside sync hook)
+            asyncio.get_event_loop().call_soon_threadsafe(
+                asyncio.ensure_future, st.set(txt)
+            )
+        elif status == "finished":
+            filepath = d.get("filename") or d.get("info_dict", {}).get("_filename")
+            if filepath:
+                result_path.append(Path(filepath))
+
+    ydl_opts = {
+        # Best H.264 ≤ 1080p + best AAC audio → merge to mp4
+        # Fallback chain handles cases where native mp4 streams aren't available
+        "format": (
+            "bestvideo[height<=1080][vcodec^=avc]+bestaudio[acodec^=mp4a]"
+            "/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[height<=1080]+bestaudio"
+            "/best[height<=1080]"
+            "/best"
+        ),
+        "merge_output_format": "mp4",
+        "outtmpl": out_tmpl,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "progress_hooks": [_progress_hook],
+        # Post-process: ensure H.264 + AAC for Telegram compatibility
+        "postprocessors": [{
+            "key": "FFmpegVideoConvertor",
+            "preferedformat": "mp4",
+        }],
+        # ffmpeg flags: faststart for streaming in Telegram
+        "postprocessor_args": {
+            "ffmpeg": [
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "18",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-movflags", "+faststart",
+                "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            ]
+        },
+        "retries": 5,
+        "fragment_retries": 5,
+        # Update yt-dlp extractor info to handle YouTube API changes
+        "extractor_args": {"youtube": {"skip": ["hls", "dash"]}},
+    }
+
+    loop = asyncio.get_running_loop()
+
+    def _download():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+    await loop.run_in_executor(None, _download)
+
+    # Find the output file (yt-dlp may rename it during post-processing)
+    if result_path:
+        # yt-dlp sometimes appends .mp4 during merge
+        candidate = result_path[-1]
+        if candidate.exists():
+            return candidate
+        # Try with .mp4 extension
+        mp4 = candidate.with_suffix(".mp4")
+        if mp4.exists():
+            return mp4
+
+    # Fallback: find any mp4 in dest_dir
+    mp4s = sorted(dest_dir.glob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if mp4s:
+        return mp4s[0]
+
+    # Any video file
+    for ext in ("*.mp4", "*.mkv", "*.webm", "*.mov"):
+        files = sorted(dest_dir.glob(ext), key=lambda f: f.stat().st_mtime, reverse=True)
+        if files:
+            return files[0]
+
+    raise RuntimeError("yt-dlp finished but no output file found in download directory.")
+
+
+# ── YouTube job ────────────────────────────────────────────────────────────────
+
+async def process_youtube_job(orig_msg: Message, uid: int,
+                               url: str, status_msg: Message):
+    job_dir   = DOWNLOAD_DIR / uuid.uuid4().hex[:8]
+    job_dir.mkdir(parents=True, exist_ok=True)
+    parts_dir = None
+    t0        = time.time()
+
+    st = LiveStatus(status_msg)
+    await st.start(
+        f"🔍 *Fetching YouTube info...*\n\n"
+        f"`{url[:60]}{'...' if len(url)>60 else ''}`\n\n"
+        f"_Send_ `stop` _to cancel_"
+    )
+
+    try:
+        # ── 1. Fetch metadata ──────────────────────────────────────────────────
+        if is_stopped(uid):
+            raise asyncio.CancelledError("Stopped")
+
+        info = await get_yt_info(url)
+        if not info:
+            raise RuntimeError("Could not fetch video info. The URL may be private, age-restricted, or unavailable.")
+
+        title    = info.get("title", "video")[:80]
+        duration = info.get("duration") or 0
+        uploader = info.get("uploader") or info.get("channel") or "YouTube"
+        # Estimate size from filesize_approx or duration × ~2 MB/s for 1080p
+        est_size = info.get("filesize_approx") or int(duration * 2_000_000)
+
+        await st.now(
+            f"📺 *{title}*\n"
+            f"👤 {uploader}  ·  ⏱ {int(duration//60)}m {int(duration%60)}s\n"
+            f"📦 Est. size: ~{human_size(est_size)}\n\n"
+            f"⏬ Downloading 1080p MP4..."
+        )
+
+        # ── 2. Download ────────────────────────────────────────────────────────
+        if is_stopped(uid):
+            raise asyncio.CancelledError("Stopped")
+
+        result = await download_youtube(url, job_dir, st, t0, uid)
+
+        if not result.exists():
+            raise RuntimeError("Download finished but output file missing.")
+        if is_stopped(uid):
+            raise asyncio.CancelledError("Stopped")
+
+        actual  = result.stat().st_size
+        dl_time = since(t0)
+        filename = result.name
+        log.info(f"YT downloaded '{filename}' {human_size(actual)} in {dl_time}")
+
+        thresh  = SPLIT_SIZE_MB * 1024 * 1024
+        n_parts = max(1, math.ceil(actual / thresh))
+
+        # ── 3. Upload or split+upload ──────────────────────────────────────────
+        if n_parts == 1:
+            await st.now(
+                f"✅ *Downloaded* in {dl_time}\n\n"
+                f"📺 *{title}*\n"
+                f"{human_size(actual)}\n\n📤 Uploading to Telegram..."
+            )
+            await do_upload(
+                orig_msg, result,
+                f"📺 {title}\n{human_size(actual)} · via @{(await app.get_me()).username}",
+                st,
+                f"📺 *{title}*\n\n",
+                t0,
+            )
+            await st.done(
+                f"✅ *Done!*\n\n"
+                f"📺 *{title}*\n"
+                f"{human_size(actual)} · ⏱ {since(t0)}"
+            )
+        else:
+            await st.now(
+                f"✅ *Downloaded* in {dl_time}\n\n"
+                f"📺 *{title}* — {human_size(actual)}\n\n"
+                f"✂️ Splitting into {n_parts} parts..."
+            )
+            parts, parts_dir = await do_split(result, n_parts, st, filename, t0, uid)
+            if is_stopped(uid):
+                raise asyncio.CancelledError("Stopped")
+
+            total_parts = len(parts)
+            result.unlink(missing_ok=True)
+
+            for i, part in enumerate(parts, 1):
+                if is_stopped(uid):
+                    raise asyncio.CancelledError("Stopped")
+                ps     = part.stat().st_size
+                prefix = f"✂️ *{total_parts} parts*\n\nPart *{i}/{total_parts}* — {human_size(ps)}\n\n"
+                await do_upload(
+                    orig_msg, part,
+                    f"📺 {title}\nPart {i}/{total_parts} — {human_size(ps)}",
+                    st, prefix, t0,
+                )
+                part.unlink(missing_ok=True)
+                log.info(f"YT: sent part {i}/{total_parts}")
+
+            await st.done(
+                f"✅ *All done!*\n\n"
+                f"📺 *{title}*\n"
+                f"{human_size(actual)} → {total_parts} parts\n"
+                f"⏱ Total: {since(t0)}\n"
+                f"_Re-encoded H.264 — playable in Telegram_"
+            )
+
+    except asyncio.CancelledError:
+        await st.done("🛑 *Stopped.*\n\nSend a YouTube URL or forward a file to start again.")
+    except Exception as e:
+        log.exception("YouTube job error")
+        await st.done(f"❌ *Error*\n\n`{e}`")
+    finally:
+        stop_flags.pop(uid, None)
+        if parts_dir and parts_dir.exists():
+            shutil.rmtree(parts_dir, ignore_errors=True)
+        if job_dir.exists():
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
 # ── Download via Pyrogram MTProto ──────────────────────────────────────────────
 
 async def download_file(msg: Message, dest: Path,
                          st: LiveStatus, t0: float, uid: int) -> Path:
     """
     Download the media from a Pyrogram Message object directly.
-    This is the correct way — Pyrogram Message has the native MTProto
-    file reference, no file_id conversion needed.
-    Works for files of ANY size.
+    Works for files of ANY size via MTProto.
     """
-    # Get file size from the message media object
     media     = msg.document or msg.video or msg.audio or msg.voice or msg.video_note
     file_size = getattr(media, "file_size", 0) or 0
     filename  = getattr(media, "file_name", None) or dest.name
@@ -285,7 +579,6 @@ async def do_split(src: Path, n: int, st: LiveStatus,
     chunk = math.ceil(size / n)
     done  = asyncio.Event()
     si    = 0
-    ts    = time.time()
 
     async def watch():
         nonlocal si
@@ -321,8 +614,6 @@ async def do_split(src: Path, n: int, st: LiveStatus,
 async def do_upload(orig_msg: Message, path: Path, caption: str,
                      st: LiveStatus, prefix: str, t0: float):
     size   = path.stat().st_size
-    ts     = time.time()
-    done   = asyncio.Event()
     si     = 0
     name   = path.name
 
@@ -358,7 +649,7 @@ async def do_upload(orig_msg: Message, path: Path, caption: str,
         )
 
 
-# ── Core job ───────────────────────────────────────────────────────────────────
+# ── Core file-split job ────────────────────────────────────────────────────────
 
 async def process_job(orig_msg: Message, uid: int, n_parts: int,
                        status_msg: Message):
@@ -463,9 +754,11 @@ async def process_job(orig_msg: Message, uid: int, n_parts: int,
 @app.on_message(filters.command(["start", "help"]))
 async def cmd_start(_, msg: Message):
     await msg.reply(
-        "📦 **File Splitter Bot**\n\n"
-        "Forward any file — I'll split it into parts and send them back.\n\n"
-        f"• Default part size: **{SPLIT_SIZE_MB} MB**\n"
+        "📦 **File Splitter + YouTube Downloader Bot**\n\n"
+        "**Forward a file** — I'll split it into parts and send them back.\n\n"
+        "**Send a YouTube URL** — I'll download it at **1080p** (H.264 MP4), "
+        "split if needed, and send it back — Telegram-playable!\n\n"
+        f"• Part size limit: **{SPLIT_SIZE_MB} MB**\n"
         "• Video parts: re-encoded H.264 — **playable in Telegram**\n"
         "• All file sizes supported via MTProto\n\n"
         "Send `stop` anytime to cancel.\n"
@@ -582,10 +875,10 @@ async def handle_file(_, msg: Message):
 @app.on_message(filters.private & filters.text)
 async def handle_text(_, msg: Message):
     uid  = msg.from_user.id
-    text = msg.text.strip().lower()
+    text = msg.text.strip()
 
-    # Stop command as plain text
-    if text == "stop":
+    # ── Stop command ───────────────────────────────────────────────────────────
+    if text.lower() == "stop":
         if uid in stop_flags:
             stop_flags[uid].set()
             await msg.reply("🛑 Stop signal sent — cancelling...")
@@ -593,7 +886,25 @@ async def handle_text(_, msg: Message):
             await msg.reply("Nothing is running.")
         return
 
-    # Parts answer
+    # ── YouTube URL detection ──────────────────────────────────────────────────
+    yt_url = extract_youtube_url(text)
+    if yt_url:
+        if not is_allowed(uid):
+            await msg.reply("❌ Not authorized.")
+            return
+        if uid in stop_flags:
+            await msg.reply("⚠️ A job is already running. Send `stop` first.")
+            return
+        # Clear any pending file split confirmation
+        pending.pop(uid, None)
+        status_msg = await msg.reply("⚙️ Starting YouTube download...")
+        stop_flags[uid] = asyncio.Event()
+        asyncio.create_task(
+            process_youtube_job(msg, uid, yt_url, status_msg)
+        )
+        return
+
+    # ── Parts answer (file split confirmation) ─────────────────────────────────
     if uid not in pending:
         return
 
@@ -605,7 +916,7 @@ async def handle_text(_, msg: Message):
 
     default_parts = max(1, math.ceil(size_mb / SPLIT_SIZE_MB))
 
-    if text in ("auto", "0", ""):
+    if text.lower() in ("auto", "0", ""):
         n_parts = default_parts
     else:
         try:
